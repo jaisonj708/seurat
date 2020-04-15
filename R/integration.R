@@ -126,8 +126,7 @@ FindIntegrationAnchors <- function(
       "SelectIntegrationFeatures -> PrepSCTIntegration -> ",
       "FindIntegrationAnchors.")
     }
-    sct.check <- TRUE
-      sapply(
+    sct.check <- sapply(
       X = 1:length(x = object.list),
       FUN = function(x) {
         sct.cmd <- grep(
