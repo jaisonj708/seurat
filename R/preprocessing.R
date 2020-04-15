@@ -1146,8 +1146,11 @@ SampleUMI <- function(
 #' @param object A seurat object
 #' @param assay Name of assay to pull the count data from; default is 'RNA'
 #' @param new.assay.name Name for the new assay containing the normalized data
+#' @param split.by Cell attribute to split by for independent vst transformations
 #' @param do.correct.umi Place corrected UMI matrix in assay counts slot; default is TRUE
-#' @param ncells Number of subsampling cells used to build NB regression; default is NULL
+#' @param ncells Number of subsampling cells used to build NB regression; if split.by is specified,
+#' ncells applies to each split.by group; a named vector/list with subsampling numbers for 
+#' any subset of split.by groups may also be provided; default is NULL
 #' @param variable.features.n Use this many features as variable features after
 #' ranking by residual variance; default is 3000
 #' @param variable.features.rv.th Instead of setting a fixed number of variable features,
@@ -1187,6 +1190,7 @@ SCTransform <- function(
   object,
   assay = 'RNA',
   new.assay.name = 'SCT',
+  split.by = NULL,
   do.correct.umi = TRUE,
   ncells = NULL,
   variable.features.n = 3000,
@@ -1204,9 +1208,6 @@ SCTransform <- function(
   if (!is.null(x = seed.use)) {
     set.seed(seed = seed.use)
   }
-  assay <- assay %||% DefaultAssay(object = object)
-  assay.obj <- GetAssay(object = object, assay = assay)
-  umi <- GetAssayData(object = assay.obj, slot = 'counts')
   cell.attr <- slot(object = object, name = 'meta.data')
   vst.args <- list(...)
   # check for batch_var in meta data
@@ -1243,129 +1244,230 @@ SCTransform <- function(
       immediate. = TRUE
     )
   }
-  vst.args[['umi']] <- umi
-  vst.args[['cell_attr']] <- cell.attr
-  vst.args[['show_progress']] <- verbose
-  vst.args[['return_cell_attr']] <- TRUE
-  vst.args[['return_gene_attr']] <- TRUE
-  vst.args[['return_corrected_umi']] <- do.correct.umi
-  vst.args[['n_cells']] <- ncells
-  residual.type <- vst.args[['residual_type']] %||% 'pearson'
-  res.clip.range <- vst.args[['res_clip_range']] %||% c(-sqrt(x = ncol(x = umi)), sqrt(x = ncol(x = umi)))
-  if (conserve.memory) {
-    return.only.var.genes <- TRUE
-  }
-  if (conserve.memory) {
-    vst.args[['residual_type']] <- 'none'
-    vst.out <- do.call(what = 'vst', args = vst.args)
-    feature.variance <- get_residual_var(
-      vst_out = vst.out,
-      umi = umi,
-      residual_type = residual.type,
-      res_clip_range = res.clip.range
-    )
-    vst.out$gene_attr$residual_variance <- NA_real_
-    vst.out$gene_attr[names(x = feature.variance), 'residual_variance'] <- feature.variance
+  
+  # split object by split.by
+  if (!is.null(split.by)) {
+    if (verbose) {
+      message('Splitting object by attribute: ', split.by)
+    }
+    object.list <- SplitObject(object = object, split.by = split.by)
   } else {
-    vst.out <- do.call(what = 'vst', args = vst.args)
-    feature.variance <- setNames(
-      object = vst.out$gene_attr$residual_variance,
-      nm = rownames(x = vst.out$gene_attr)
-    )
+    object.list <- list(object)
   }
+  
+  # reformat and error-check ncells
+  if (length(ncells) > 1) {
+    if (is.null(split.by)) { stop("ncells has multiple elements even though split.by is not specified") }
+    if (is.null(names(ncells))) { stop("ncells must be named with corresponding groups") }
+    if (length(bad.names <- setdiff(names(ncells), names(object.list))) != 0) {
+      stop("The following group names in ncells do not match a split.by group: ", 
+           paste(bad.names, collapse = ", "))
+    }
+    ncells <- lapply(X = names(object.list), 
+                     FUN = function(n) { return(ifelse(n %in% names(ncells), ncells[[n]], NA)) })
+  } else {
+    ncells <- rep_len(ifelse(is.null(ncells), NA, ncells), length.out = length(object.list))
+  }
+  
+  assay <- assay %||% DefaultAssay(object = object.list[[1]])
+  vst.list <- list()
+  feature.list <- list()
+  # call sctransform on each split.by group
+  for (i in 1:length(object.list)) {
+    obj <- object.list[[i]]
+    assay.obj <- GetAssay(object = obj, assay = assay)
+    umi <- GetAssayData(object = assay.obj, slot = 'counts')
+    cell.attr <- slot(object = obj, name = 'meta.data')
+    
+    if (verbose & !is.null(split.by)) {
+      message('Running sctransform on group: ', names(object.list)[i])
+    } 
+    vst.args[['umi']] <- umi
+    vst.args[['cell_attr']] <- cell.attr
+    vst.args[['show_progress']] <- verbose
+    vst.args[['return_cell_attr']] <- TRUE
+    vst.args[['return_gene_attr']] <- TRUE
+    vst.args[['return_corrected_umi']] <- do.correct.umi
+    
+    if (is.na(ncells[[i]])) {
+      ncells_ <- NULL
+    } else {
+      ncells_ <- ncells[[i]]
+    }
+    vst.args[['n_cells']] <- ncells_
+    residual.type <- vst.args[['residual_type']] %||% 'pearson'
+    res.clip.range <- vst.args[['res_clip_range']] %||% c(-sqrt(x = ncol(x = umi)), sqrt(x = ncol(x = umi)))
+    if (conserve.memory) {
+      return.only.var.genes <- TRUE
+    }
+    if (conserve.memory) {
+      vst.args[['residual_type']] <- 'none'
+      vst.out <- do.call(what = 'vst', args = vst.args)
+      feature.variance <- get_residual_var(
+        vst_out = vst.out,
+        umi = umi,
+        residual_type = residual.type,
+        res_clip_range = res.clip.range
+      )
+      vst.out$gene_attr$residual_variance <- NA_real_
+      vst.out$gene_attr[names(x = feature.variance), 'residual_variance'] <- feature.variance
+    } else {
+      vst.out <- do.call(what = 'vst', args = vst.args)
+      feature.variance <- setNames(
+        object = vst.out$gene_attr$residual_variance,
+        nm = rownames(x = vst.out$gene_attr)
+      )
+    }
+    vst.list[[i]] <- vst.out
+    feature.list[[i]] <- sort(x = feature.variance, decreasing = TRUE)
+  }
+  
+  # collect top variable features
   if (verbose) {
     message('Determine variable features')
   }
-  feature.variance <- sort(x = feature.variance, decreasing = TRUE)
-  if (!is.null(x = variable.features.n)) {
-    top.features <- names(x = feature.variance)[1:min(variable.features.n, length(x = feature.variance))]
-  } else {
-    top.features <- names(x = feature.variance)[feature.variance >= variable.features.rv.th]
-  }
-  if (verbose) {
-    message('Set ', length(x = top.features), ' variable features')
-  }
-  if (conserve.memory) {
-    # actually get the residuals this time
-    if (verbose) {
-      message("Return only variable features for scale.data slot of the output assay")
+  top.features <- list()
+  all.features <- list()
+  for (i in 1:length(object.list)) {
+    feature.variance <- feature.list[[i]]
+    all.features[[i]] <- names(feature.variance)
+    if (!is.null(x = variable.features.n)) {
+      top.features[[i]] <- names(x = feature.variance)[1:min(variable.features.n, length(x = feature.variance))]
+    } else {
+      top.features[[i]] <- names(x = feature.variance)[feature.variance >= variable.features.rv.th]
     }
-    vst.out$y <- get_residuals(
-      vst_out = vst.out,
-      umi = umi[top.features, ],
-      residual_type = residual.type,
-      res_clip_range = res.clip.range
-    )
-    if (do.correct.umi & residual.type == 'pearson') {
-      vst.out$umi_corrected <- correct_counts(
-        x = vst.out,
-        umi = umi,
-        show_progress = verbose
+  }
+  top.features <- Reduce(union, top.features)
+  all.features <- Reduce(intersect, all.features)
+  top.features <- intersect(top.features, all.features)
+  
+  # build Assays from vst outputs
+  for (i in 1:length(object.list)) {
+    vst.out <- vst.list[[i]]
+    obj <- object.list[[i]]
+    assay.obj <- GetAssay(object = obj, assay = assay)
+    umi <- GetAssayData(object = assay.obj, slot = 'counts')
+    cell.attr <- slot(object = obj, name = 'meta.data')
+    
+    if (conserve.memory) {
+      # actually get the residuals this time
+      if (verbose) {
+        message("Return only variable features for scale.data slot of the output assay")
+      }
+      vst.out$y <- get_residuals(
+        vst_out = vst.out,
+        umi = umi[top.features, ],
+        residual_type = residual.type,
+        res_clip_range = res.clip.range
       )
+      if (do.correct.umi & residual.type == 'pearson') {
+        vst.out$umi_corrected <- correct_counts(
+          x = vst.out,
+          umi = umi,
+          show_progress = verbose
+        )
+      }
     }
+    # create output assay and put (corrected) umi counts in count slot
+    if (do.correct.umi & residual.type == 'pearson') {
+      if (verbose) {
+        message('Place corrected count matrix in counts slot')
+      }
+      assay.out <- CreateAssayObject(counts = vst.out$umi_corrected)
+      vst.out$umi_corrected <- NULL
+    } else {
+      assay.out <- CreateAssayObject(counts = umi)
+    }
+    # set the variable genes
+    VariableFeatures(object = assay.out) <- top.features
+    # put log1p transformed counts in data
+    assay.out <- SetAssayData(
+      object = assay.out,
+      slot = 'data',
+      new.data = log1p(x = GetAssayData(object = assay.out, slot = 'counts'))
+    )
+    if (return.only.var.genes & !conserve.memory) {
+      scale.data <- vst.out$y[top.features, ]
+    } else {
+      scale.data <- vst.out$y
+    }
+    # clip the residuals
+    scale.data[scale.data < clip.range[1]] <- clip.range[1]
+    scale.data[scale.data > clip.range[2]] <- clip.range[2]
+    # 2nd regression
+    scale.data <- ScaleData(
+      scale.data,
+      features = NULL,
+      vars.to.regress = vars.to.regress,
+      latent.data = cell.attr[, vars.to.regress, drop = FALSE],
+      model.use = 'linear',
+      use.umi = FALSE,
+      do.scale = do.scale,
+      do.center = do.center,
+      scale.max = Inf,
+      block.size = 750,
+      min.cells.to.block = 3000,
+      verbose = verbose
+    )
+    assay.out <- SetAssayData(
+      object = assay.out,
+      slot = 'scale.data',
+      new.data = scale.data
+    )
+    vst.out$y <- NULL
+    vst.list[[i]] <- vst.out
+    object.list[[i]][[new.assay.name]] <- assay.out
   }
-  # create output assay and put (corrected) umi counts in count slot
-  if (do.correct.umi & residual.type == 'pearson') {
+  
+  # prepare object for returning
+  if (length(object.list) == 1) {
+    object <- object.list[[1]]
+    assay.out <- object[[new.assay.name]]
+    vst.out <- vst.list[[1]]
+    # save clip.range into vst model
+    vst.out$arguments$sct.clip.range <- clip.range
+    Misc(object = assay.out, slot = 'vst.out') <- vst.out
+    Misc(object = assay.out, slot = 'umi.assay') <- assay
+    # also put gene attributes in meta.features
+    assay.out[[paste0('sct.', names(x = vst.out$gene_attr))]] <- vst.out$gene_attr
+    assay.out[['sct.variable']] <- rownames(x = assay.out[[]]) %in% top.features
+    object[[new.assay.name]] <- assay.out
     if (verbose) {
-      message('Place corrected count matrix in counts slot')
+      message(paste("Set default assay to", new.assay.name))
     }
-    assay.out <- CreateAssayObject(counts = vst.out$umi_corrected)
-    vst.out$umi_corrected <- NULL
+    DefaultAssay(object = object) <- new.assay.name
+    object <- LogSeuratCommand(object = object)
+    
+    return(object)
   } else {
-    assay.out <- CreateAssayObject(counts = umi)
+    if (verbose) {
+      message('Merging split objects')
+    }
+    if (!all(unlist(lapply(X = object.list,
+                           FUN = function(obj) {
+                             return(colnames(obj@meta.data) == colnames(object.list[[1]]@meta.data))
+                             })))) {
+      warning("Split objects have been modified such that metadata column names are no longer identical")
+    }
+    object <- merge(x = object.list[[1]], y = object.list[-1], merge.data = TRUE)
+    object[[new.assay.name]] <- SetAssayData(
+      object = object[[new.assay.name]],
+      slot = "scale.data",
+      new.data = do.call(what = cbind,
+                         args = lapply(X = object.list, FUN = function(x) x[[new.assay.name]]@scale.data))
+    )
+    VariableFeatures(object[[new.assay.name]]) <- top.features
+    
+    names(vst.list) <- names(object.list)
+    Misc(object = object[[new.assay.name]], slot = 'vst.out.list') <- vst.list
+    Misc(object = object[[new.assay.name]], slot = 'umi.assay') <- assay
+    if (verbose) {
+      message(paste("Set default assay to", new.assay.name))
+    }
+    DefaultAssay(object = object) <- new.assay.name
+    object <- LogSeuratCommand(object = object)
+    return(object)
   }
-  # set the variable genes
-  VariableFeatures(object = assay.out) <- top.features
-  # put log1p transformed counts in data
-  assay.out <- SetAssayData(
-    object = assay.out,
-    slot = 'data',
-    new.data = log1p(x = GetAssayData(object = assay.out, slot = 'counts'))
-  )
-  if (return.only.var.genes & !conserve.memory) {
-    scale.data <- vst.out$y[top.features, ]
-  } else {
-    scale.data <- vst.out$y
-  }
-  # clip the residuals
-  scale.data[scale.data < clip.range[1]] <- clip.range[1]
-  scale.data[scale.data > clip.range[2]] <- clip.range[2]
-  # 2nd regression
-  scale.data <- ScaleData(
-    scale.data,
-    features = NULL,
-    vars.to.regress = vars.to.regress,
-    latent.data = cell.attr[, vars.to.regress, drop = FALSE],
-    model.use = 'linear',
-    use.umi = FALSE,
-    do.scale = do.scale,
-    do.center = do.center,
-    scale.max = Inf,
-    block.size = 750,
-    min.cells.to.block = 3000,
-    verbose = verbose
-  )
-  assay.out <- SetAssayData(
-    object = assay.out,
-    slot = 'scale.data',
-    new.data = scale.data
-  )
-  # save vst output (except y) in @misc slot
-  vst.out$y <- NULL
-  # save clip.range into vst model
-  vst.out$arguments$sct.clip.range <- clip.range
-  Misc(object = assay.out, slot = 'vst.out') <- vst.out
-  Misc(object = assay.out, slot = 'umi.assay') <- assay
-  # also put gene attributes in meta.features
-  assay.out[[paste0('sct.', names(x = vst.out$gene_attr))]] <- vst.out$gene_attr
-  assay.out[['sct.variable']] <- rownames(x = assay.out[[]]) %in% top.features
-  object[[new.assay.name]] <- assay.out
-  if (verbose) {
-    message(paste("Set default assay to", new.assay.name))
-  }
-  DefaultAssay(object = object) <- new.assay.name
-  object <- LogSeuratCommand(object = object)
-  return(object)
 }
 
 #' Subset a Seurat Object based on the Barcode Distribution Inflection Points
